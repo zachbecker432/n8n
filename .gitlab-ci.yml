@@ -1,0 +1,274 @@
+# GitLab CI/CD configuration for building and pushing n8n Docker images
+# This pipeline builds the full n8n application and pushes it to a container registry
+
+variables:
+  # Node.js configuration
+  NODE_VERSION: "22.21.1"
+  NODE_OPTIONS: "--max-old-space-size=7168"
+
+  # pnpm configuration
+  PNPM_VERSION: "10.22.0"
+
+  # Docker image configuration
+  # Override these in GitLab CI/CD settings or pipeline triggers
+  IMAGE_NAME: "${CI_REGISTRY_IMAGE}/n8n"
+  IMAGE_TAG: "${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}"
+
+  # Build configuration
+  N8N_RELEASE_TYPE: "dev"
+  CI: "true"
+
+  # Docker build settings
+  DOCKER_BUILDKIT: "1"
+  DOCKER_TLS_CERTDIR: "/certs"
+
+# Cache configuration for faster builds
+.pnpm_cache: &pnpm_cache
+  key:
+    files:
+      - pnpm-lock.yaml
+    prefix: pnpm-${CI_COMMIT_REF_SLUG}
+  paths:
+    - .pnpm-store/
+  policy: pull-push
+
+.node_modules_cache: &node_modules_cache
+  key:
+    files:
+      - pnpm-lock.yaml
+    prefix: node-modules-${CI_COMMIT_REF_SLUG}
+  paths:
+    - node_modules/
+    - packages/*/node_modules/
+    - packages/@n8n/*/node_modules/
+    - packages/frontend/**/node_modules/
+    - packages/extensions/**/node_modules/
+    - packages/testing/**/node_modules/
+  policy: pull-push
+
+stages:
+  - build
+  - docker
+  - push
+
+# =============================================================================
+# Build Stage: Compile the n8n application
+# =============================================================================
+build:
+  stage: build
+  image: node:${NODE_VERSION}-alpine
+  before_script:
+    # Install system dependencies
+    - apk add --no-cache git python3 make g++ bash
+
+    # Install pnpm
+    - corepack enable
+    - corepack prepare pnpm@${PNPM_VERSION} --activate
+    - pnpm config set store-dir .pnpm-store
+
+  script:
+    # Install dependencies
+    - echo "Installing dependencies..."
+    - pnpm install --frozen-lockfile
+
+    # Build the application
+    - echo "Building n8n application..."
+    - pnpm build
+
+    # Skip license generation for faster CI builds
+    - export N8N_SKIP_LICENSES=true
+
+    # Prepare for deployment (clean package.json files for production)
+    - echo "Preparing production deployment..."
+    - node .github/scripts/trim-fe-packageJson.js
+
+    # Create compiled directory with production dependencies
+    - echo "Creating production deployment..."
+    - NODE_ENV=production DOCKER_BUILD=true pnpm --filter=n8n --prod --legacy deploy --no-optional ./compiled
+
+    # Create task runner deployment
+    - echo "Creating task runner deployment..."
+    - mkdir -p dist/task-runner-javascript
+    - NODE_ENV=production DOCKER_BUILD=true pnpm --filter=@n8n/task-runner --prod --legacy deploy --no-optional ./dist/task-runner-javascript
+
+    # Create build manifest
+    - |
+      cat > compiled/build-manifest.json << EOF
+      {
+        "buildTime": "$(date -Iseconds)",
+        "gitCommit": "${CI_COMMIT_SHA}",
+        "gitBranch": "${CI_COMMIT_REF_NAME}",
+        "pipelineId": "${CI_PIPELINE_ID}"
+      }
+      EOF
+
+  artifacts:
+    paths:
+      - compiled/
+      - dist/task-runner-javascript/
+      - docker/
+    expire_in: 1 hour
+
+  cache:
+    - <<: *pnpm_cache
+    - <<: *node_modules_cache
+
+  rules:
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+# =============================================================================
+# Docker Stage: Build Docker images
+# =============================================================================
+docker:build:
+  stage: docker
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  needs:
+    - job: build
+      artifacts: true
+  before_script:
+    - docker info
+
+  script:
+    # Build the n8n Docker image
+    - echo "Building n8n Docker image..."
+    - |
+      docker build \
+        --build-arg NODE_VERSION=${NODE_VERSION} \
+        --build-arg N8N_VERSION=${CI_COMMIT_REF_NAME} \
+        --build-arg N8N_RELEASE_TYPE=${N8N_RELEASE_TYPE} \
+        --tag ${IMAGE_NAME}:${IMAGE_TAG} \
+        --tag ${IMAGE_NAME}:${CI_COMMIT_REF_SLUG} \
+        --file docker/images/n8n/Dockerfile \
+        .
+
+    # Also tag as latest if on main/master branch
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "master" ] || [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest
+      fi
+
+    # Save the image as artifact for the push stage
+    - docker save ${IMAGE_NAME}:${IMAGE_TAG} | gzip > n8n-image.tar.gz
+
+  artifacts:
+    paths:
+      - n8n-image.tar.gz
+    expire_in: 1 hour
+
+  rules:
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+# =============================================================================
+# Push Stage: Push Docker images to registry
+# =============================================================================
+docker:push:
+  stage: push
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  needs:
+    - job: docker:build
+      artifacts: true
+  before_script:
+    - docker info
+    # Login to GitLab Container Registry
+    - echo "${CI_REGISTRY_PASSWORD}" | docker login -u "${CI_REGISTRY_USER}" --password-stdin ${CI_REGISTRY}
+
+  script:
+    # Load the saved image
+    - gunzip -c n8n-image.tar.gz | docker load
+
+    # Push all tags
+    - echo "Pushing ${IMAGE_NAME}:${IMAGE_TAG}..."
+    - docker push ${IMAGE_NAME}:${IMAGE_TAG}
+
+    - echo "Pushing ${IMAGE_NAME}:${CI_COMMIT_REF_SLUG}..."
+    - docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:${CI_COMMIT_REF_SLUG}
+    - docker push ${IMAGE_NAME}:${CI_COMMIT_REF_SLUG}
+
+    # Push latest tag if on main/master branch
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "master" ] || [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        echo "Pushing ${IMAGE_NAME}:latest..."
+        docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest
+        docker push ${IMAGE_NAME}:latest
+      fi
+
+  rules:
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+# =============================================================================
+# Optional: Push to external registry (e.g., Docker Hub, ECR, GCR)
+# Uncomment and configure as needed
+# =============================================================================
+# docker:push:external:
+#   stage: push
+#   image: docker:24-dind
+#   services:
+#     - docker:24-dind
+#   needs:
+#     - job: docker:build
+#       artifacts: true
+#   variables:
+#     # Configure these in GitLab CI/CD settings
+#     EXTERNAL_REGISTRY: "docker.io"  # or your registry URL
+#     EXTERNAL_IMAGE_NAME: "your-username/n8n"
+#   before_script:
+#     - docker info
+#     # Login to external registry (configure EXTERNAL_REGISTRY_USER and EXTERNAL_REGISTRY_PASSWORD in CI/CD settings)
+#     - echo "${EXTERNAL_REGISTRY_PASSWORD}" | docker login -u "${EXTERNAL_REGISTRY_USER}" --password-stdin ${EXTERNAL_REGISTRY}
+#   script:
+#     # Load the saved image
+#     - gunzip -c n8n-image.tar.gz | docker load
+#
+#     # Retag for external registry
+#     - docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${EXTERNAL_REGISTRY}/${EXTERNAL_IMAGE_NAME}:${IMAGE_TAG}
+#     - docker push ${EXTERNAL_REGISTRY}/${EXTERNAL_IMAGE_NAME}:${IMAGE_TAG}
+#
+#     # Push latest if on main/master
+#     - |
+#       if [ "$CI_COMMIT_BRANCH" = "master" ] || [ "$CI_COMMIT_BRANCH" = "main" ]; then
+#         docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${EXTERNAL_REGISTRY}/${EXTERNAL_IMAGE_NAME}:latest
+#         docker push ${EXTERNAL_REGISTRY}/${EXTERNAL_IMAGE_NAME}:latest
+#       fi
+#   rules:
+#     - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+#     - if: $CI_COMMIT_TAG
+#   when: manual  # Require manual trigger for external push
+
+# =============================================================================
+# Release: Build and push with version tag
+# Triggered on Git tags
+# =============================================================================
+release:
+  stage: push
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  needs:
+    - job: docker:build
+      artifacts: true
+  variables:
+    N8N_RELEASE_TYPE: "stable"
+  before_script:
+    - docker info
+    - echo "${CI_REGISTRY_PASSWORD}" | docker login -u "${CI_REGISTRY_USER}" --password-stdin ${CI_REGISTRY}
+  script:
+    # Load the saved image
+    - gunzip -c n8n-image.tar.gz | docker load
+
+    # Tag with version
+    - docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:${CI_COMMIT_TAG}
+    - docker push ${IMAGE_NAME}:${CI_COMMIT_TAG}
+
+    # Also push as latest for releases
+    - docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest
+    - docker push ${IMAGE_NAME}:latest
+
+  rules:
+    - if: $CI_COMMIT_TAG
